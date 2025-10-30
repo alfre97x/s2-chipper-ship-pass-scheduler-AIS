@@ -9,7 +9,7 @@ Contents
 - 4) Configuration (config.yaml, .env)
 - 5) Streamlit UI (Batch vs Continuous)
 - 6) Real AIS only operation
-- 7) Predictive planners (backfill, ESA Acquisition Plans, TLE)
+- 7) Predictive planners (auto, ESA Acquisition Plans, TLE, backfill)
 - 8) Predictive (tile‑constrained) collection
 - 9) Chip from AIS file (Excel/CSV)
 - 10) Prune by AIS (cleanup)
@@ -84,7 +84,7 @@ Optional environment variables (.env)
 
 Key sections (config.yaml)
 - satellite_tracking:
-  - mode: backfill | esa_plan | tle
+  - mode: auto | esa_plan | tle | backfill
   - tiles: list of MGRS tile IDs (e.g., ["T30SUJ"])
   - overpass_window_minutes: +/- window around predicted time
   - prediction_days: horizon for TLE/backfill
@@ -167,9 +167,10 @@ Main panel
 
 ---
 
-7) Predictive planners (backfill, ESA, TLE)
+7) Predictive planners (auto, ESA, TLE, backfill)
 
 Planner modes (config satellite_tracking.mode or CLI --mode)
+- auto (production): try ESA download first; fallback to TLE; schedule written and cached/versioned
 - backfill (demo): emits recent past windows (~10:30 UTC) for quick testing
 - esa_plan (production): parse an ESA Acquisition Plan CSV and filter for selected tiles; write start/end UTC per tile
   - Provide file path via satellite_tracking.esa_csv_path or CLI --esa-csv

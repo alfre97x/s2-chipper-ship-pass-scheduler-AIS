@@ -1,9 +1,12 @@
 # Global configuration for Sentinel-2 Ship Chips pipeline
 
 satellite_tracking:
-  mode: "esa_plan"        # esa_plan | tle
+  mode: "auto"        # auto | esa_plan | tle | backfill
   tiles: ["T30SUJ"]       # MGRS tiles to track (example)
   tle_source: "https://celestrak.org/NORAD/elements/sentinel.txt"
+  esa_csv_path: "plan/esa_acquisition_plan.csv"  # optional local ESA CSV (if provided manually)
+  esa_download_url: ""  # optional direct CSV URL for ESA Acquisition Plan; used when mode=auto
+  cache_dir: "plan/schedules"
   prediction_days: 7
   overpass_window_minutes: 5
   min_elevation_deg: 10

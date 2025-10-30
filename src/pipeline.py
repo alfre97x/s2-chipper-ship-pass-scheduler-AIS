@@ -24,6 +24,7 @@ from rasterio.warp import Resampling
 from pystac_client import Client
 import requests
 from orbit_predictor.sources import get_predictor_from_tle_lines
+from src.planner import download_esa_csv, write_versioned_schedule_csv
 
 
 # --------------------------
@@ -113,6 +114,23 @@ def predict_overpasses(cfg: Dict[str, Any], out_csv: Path) -> None:
     window_min = int(st_cfg.get("overpass_window_minutes", 5))
     ensure_dir(out_csv.parent)
 
+    # Auto mode: try ESA download first, then fallback to TLE if not available
+    if mode == "auto":
+        esa_url = st_cfg.get("esa_download_url")
+        cache_dir = Path(st_cfg.get("cache_dir", "plan/schedules"))
+        if esa_url:
+            downloaded = download_esa_csv(esa_url, cache_dir)
+            if downloaded and downloaded.exists():
+                st_cfg["esa_csv_path"] = str(downloaded)
+                mode = "esa_plan"
+                logger.info(f"Auto mode: using ESA plan at {downloaded}")
+            else:
+                logger.warning("Auto mode: ESA download failed or missing; falling back to TLE")
+                mode = "tle"
+        else:
+            logger.info("Auto mode: no ESA URL configured; using TLE planner")
+            mode = "tle"
+
     if mode == "esa_plan":
         # Expect a pre-downloaded ESA plan CSV with at least columns: tile_id, start_time_utc, end_time_utc [,satellite]
         esa_csv = st_cfg.get("esa_csv_path", "plan/esa_acquisition_plan.csv")
@@ -151,8 +169,8 @@ def predict_overpasses(cfg: Dict[str, Any], out_csv: Path) -> None:
                 # Default satellite label if missing
                 if "satellite" not in df.columns:
                     df["satellite"] = "S2"
-                df[["tile_id", "satellite", "start_time_utc", "end_time_utc"]].to_csv(out_csv, index=False)
-                logger.info(f"Wrote ESA-based overpass schedule: {out_csv} ({len(df)} rows)")
+                out_df = df[["tile_id", "satellite", "start_time_utc", "end_time_utc"]]
+                write_versioned_schedule_csv(out_df, out_csv, cache_dir=Path(st_cfg.get("cache_dir", "plan/schedules")))
                 return
 
     if mode == "tle":
@@ -233,8 +251,7 @@ def predict_overpasses(cfg: Dict[str, Any], out_csv: Path) -> None:
             if rows:
                 df = pd.DataFrame(rows)
                 df.sort_values(["tile_id", "start_time_utc"], inplace=True)
-                df.to_csv(out_csv, index=False)
-                logger.info(f"Wrote TLE-based overpass schedule: {out_csv} ({len(df)} rows)")
+                write_versioned_schedule_csv(df, out_csv, cache_dir=Path(st_cfg.get("cache_dir", "plan/schedules")))
                 return
             else:
                 logger.warning("No TLE-based passes computed; falling back to backfill.")
@@ -253,8 +270,7 @@ def predict_overpasses(cfg: Dict[str, Any], out_csv: Path) -> None:
                 "end_time_utc": (t + timedelta(minutes=window_min)).isoformat()
             })
     df = pd.DataFrame(rows)
-    df.to_csv(out_csv, index=False)
-    logger.info(f"Wrote backfilled overpass schedule: {out_csv} ({len(df)} rows)")
+    write_versioned_schedule_csv(df, out_csv, cache_dir=Path(st_cfg.get("cache_dir", "plan/schedules")))
 
 
 # --------------------------
