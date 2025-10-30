@@ -314,4 +314,4 @@ Common issues
 
 14) License
 
-MIT (or your chosen license).
+MIT.
