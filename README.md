@@ -1,6 +1,6 @@
 # Sentinel‑2 Ship Chips — Platform Guide
 
-End‑to‑end platform to produce “Clay‑ready” 256×256 Sentinel‑2 chips centered on vessels observed by AIS. This guide explains what the platform produces, how it works, and how to operate it in interactive (Streamlit) and scripted (CLI/scheduler) modes. It also documents data formats, configuration, “real AIS only” operation, and predictive (tile‑constrained) collection.
+End‑to‑end platform to produce “Clay‑ready” 256×256 Sentinel‑2 chips centered on vessels observed by AIS. This guide explains what the platform produces, how it works, and how to operate it in interactive (Streamlit) and scripted (CLI/scheduler) modes. It also documents data formats, configuration, “real AIS only” operation, and predictive (tile‑constrained) collection with ESA/TLE planners.
 
 Contents
 - 1) What the platform produces
@@ -9,14 +9,15 @@ Contents
 - 4) Configuration (config.yaml, .env)
 - 5) Streamlit UI (Batch vs Continuous)
 - 6) Real AIS only operation
-- 7) Predictive (tile‑constrained) collection
-- 8) Chip from AIS file (Excel/CSV)
-- 9) Prune by AIS (cleanup)
-- 10) CLI usage and scheduling
-- 11) Chipping details and data model
-- 12) Troubleshooting and FAQ
-- 13) Roadmap and extensibility
-- 14) License
+- 7) Predictive planners (backfill, ESA Acquisition Plans, TLE)
+- 8) Predictive (tile‑constrained) collection
+- 9) Chip from AIS file (Excel/CSV)
+- 10) Prune by AIS (cleanup)
+- 11) CLI usage and scheduling
+- 12) Chipping details and data model
+- 13) Troubleshooting and FAQ
+- 14) Roadmap and extensibility
+- 15) License
 
 ---
 
@@ -48,13 +49,15 @@ AIS capture snapshots
 
 2) How it works (high level)
 
+- Predict overpasses: build plan/overpass_schedule.csv via a selectable planner mode:
+  - backfill (demo), ESA plan CSV, or TLE propagation (see section 7)
 - AIS capture: connect to aisstream.io (WebSocket) to record vessel positions and metadata. In predictive mode, the subscription is constrained to active Sentinel‑2 overpass tiles (by bbox) and windows.
 - Scene search: for each AIS point to process, query Earth Search STAC (S2 L2A) near the AIS time and location. Choose best scene (closest time, cloud cover ≤ threshold).
 - Chipping: convert AIS lat/lon into the scene CRS and extract a 256×256 px window around the point. Read bands, scale to reflectance [0–1], write a compressed, tiled GeoTIFF.
 - AIS + Sanity gate (optional): reject chips whose center window is likely cloud/land or insufficient water (via SCL and NDWI thresholds).
 - Index: record per‑chip rows in tiles.parquet; append to daily footprints GeoJSON.
 
-Note on predictive operation and L2A lag
+L2A lag note
 - Sentinel‑2 L2A scenes typically appear ~2–3 days after acquisition. For guaranteed overlap and fresh scenes, collect AIS at predicted pass times/tiles, then chip after the lag (Continuous mode can handle repeated runs).
 
 ---
@@ -80,7 +83,13 @@ Optional environment variables (.env)
 4) Configuration (config.yaml, .env)
 
 Key sections (config.yaml)
-- satellite_tracking: overpass planning (demo uses backfill for recent days)
+- satellite_tracking:
+  - mode: backfill | esa_plan | tle
+  - tiles: list of MGRS tile IDs (e.g., ["T30SUJ"])
+  - overpass_window_minutes: +/- window around predicted time
+  - prediction_days: horizon for TLE/backfill
+  - tle_source: Celestrak URL (default included)
+  - esa_csv_path: path to a locally downloaded ESA plan CSV
 - ais: aisstream capture tuning (batch/reconnect)
 - stac: endpoint, collection (sentinel-2-l2a), cloud_cover_max, search_window_hours
 - tiling: chip_size_px, bands_core, bands_swir, resample method (bicubic)
@@ -158,7 +167,20 @@ Main panel
 
 ---
 
-7) Predictive (tile‑constrained) collection
+7) Predictive planners (backfill, ESA, TLE)
+
+Planner modes (config satellite_tracking.mode or CLI --mode)
+- backfill (demo): emits recent past windows (~10:30 UTC) for quick testing
+- esa_plan (production): parse an ESA Acquisition Plan CSV and filter for selected tiles; write start/end UTC per tile
+  - Provide file path via satellite_tracking.esa_csv_path or CLI --esa-csv
+- tle (production): fetch S2A/S2B TLEs from Celestrak and propagate passes over tile centers for the next N days; write windows per tile/satellite
+  - Configure prediction_days, overpass_window_minutes, tle_source
+
+All modes write: plan/overpass_schedule.csv with columns [tile_id, satellite, start_time_utc, end_time_utc]
+
+---
+
+8) Predictive (tile‑constrained) collection
 
 What it does
 - Reads plan/overpass_schedule.csv for active windows (start_time_utc ≤ now ≤ end_time_utc)
@@ -168,11 +190,11 @@ What it does
 
 Requirements and behavior
 - Requires at least one active window at the time of capture. If none are active, the collector falls back to a short global capture window.
-- In production, replace the backfilled planner with ESA Acquisition Plans/TLE propagation to ensure proper overpass times in the schedule.
+- In production, it’s recommended to use ESA or TLE planner modes for true predictive collection.
 
 ---
 
-8) Chip from AIS file (Excel/CSV)
+9) Chip from AIS file (Excel/CSV)
 
 Upload schema
 - Required columns: mmsi, lat, lon
@@ -191,7 +213,7 @@ Behavior
 
 ---
 
-9) Prune by AIS (cleanup)
+10) Prune by AIS (cleanup)
 
 Purpose
 - Keep only chips that match recorded AIS within time and position tolerances.
@@ -209,16 +231,23 @@ Run via UI: “Prune by AIS” button.
 
 ---
 
-10) CLI usage and scheduling
+11) CLI usage and scheduling
 
-Predict overpasses (demo/backfill)
+Predict overpasses
 ```
-python -m src.cli predict-overpasses --out plan/overpass_schedule.csv
+# Backfill demo
+python -m src.cli predict-overpasses --out plan/overpass_schedule.csv --mode backfill
+
+# ESA Acquisition Plans (provide downloaded CSV path)
+python -m src.cli predict-overpasses --mode esa_plan --esa-csv plan/esa_acquisition_plan.csv
+
+# TLE propagation (S2A/S2B over selected tiles)
+python -m src.cli predict-overpasses --mode tle --out plan/overpass_schedule.csv
 ```
 
 Collect AIS
 ```
-# Real AIS (requires AISSTREAM_API_KEY in .env)
+# Real AIS (requires AISSTREAM_API_KEY in .env), predictive tile restriction
 python -m src.cli collect-ais --schedule plan/overpass_schedule.csv --window-min 5 --config config.yaml --no-dry-run --restrict-to-schedule
 
 # Synthetic (testing):
@@ -235,14 +264,14 @@ python -m src.cli run --max-chips 5 --config config.yaml
 ```
 
 Scheduling (recommended for production)
-- Weekly: predict-overpasses (replace with ESA/TLE planner for true predictive)
+- Weekly: predict-overpasses (ESA or TLE mode)
 - During predicted windows: collect-ais (short run) with --restrict-to-schedule
 - After lag_days (e.g., 2–3 days): chip (use Continuous or a scheduled batch)
 - Optionally: run prune_by_ais afterward
 
 ---
 
-11) Chipping details and data model
+12) Chipping details and data model
 
 Bands and scaling
 - Core (10 m): B02,B03,B04,B08
@@ -276,7 +305,7 @@ Indexes
 
 ---
 
-12) Troubleshooting and FAQ
+13) Troubleshooting and FAQ
 
 Q: Why both “Max AIS ships to process” and “Max chips this run”?
 - Ships cap is the number of AIS attempts. Some attempts may not yield chips (no scene found, gate rejected, edge, etc.). Chips cap is a hard limit on actual outputs written. To keep things simple, “Bind chips cap to ships cap (1:1)” is ON by default, and chips cap is hidden.
@@ -299,10 +328,8 @@ Common issues
 
 ---
 
-13) Roadmap and extensibility
+14) Roadmap and extensibility
 
-- Predictive scheduler (production):
-  - ESA Acquisition Plans parser; TLE propagation (sgp4/orbit-predictor installed)
 - Provider abstraction:
   - Add CDSE/STAC alternative backends
 - Storage:
@@ -312,6 +339,6 @@ Common issues
 
 ---
 
-14) License
+15) License
 
 MIT.

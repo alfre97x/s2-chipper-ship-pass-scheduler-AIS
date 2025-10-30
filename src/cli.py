@@ -17,9 +17,15 @@ app = typer.Typer(help="Sentinel-2 Ship Chips pipeline CLI")
 def cli_predict_overpasses(
     config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config.yaml"),
     out_csv: str = typer.Option("plan/overpass_schedule.csv", "--out", "-o", help="Output schedule CSV path"),
+    mode: str = typer.Option(None, "--mode", "-m", help="Planner mode: backfill | esa_plan | tle"),
+    esa_csv_path: str = typer.Option(None, "--esa-csv", help="Path to ESA Acquisition Plan CSV when using esa_plan"),
 ):
-    """Produce an overpass schedule CSV (MVP heuristic; upgrade to ESA/TLE later)."""
+    """Produce an overpass schedule CSV (supports backfill, ESA plan CSV, and TLE modes)."""
     cfg = load_config(config)
+    if mode:
+        cfg.setdefault("satellite_tracking", {})["mode"] = mode
+    if esa_csv_path:
+        cfg.setdefault("satellite_tracking", {})["esa_csv_path"] = esa_csv_path
     out = Path(out_csv)
     predict_overpasses(cfg, out)
     logger.info(f"Overpass schedule written: {out}")

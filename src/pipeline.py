@@ -22,6 +22,8 @@ from rasterio.windows import Window
 from rasterio.transform import Affine
 from rasterio.warp import Resampling
 from pystac_client import Client
+import requests
+from orbit_predictor.sources import get_predictor_from_tle_lines
 
 
 # --------------------------
@@ -99,12 +101,146 @@ def layout_paths(cfg: Dict[str, Any], split: str, mmsi: str, date_str: str, chip
 
 def predict_overpasses(cfg: Dict[str, Any], out_csv: Path) -> None:
     """
-    Minimal MVP: emit a backfilled schedule (past N days at 10:30 UTC)
-    so STAC search finds available scenes during testing. Upgrade to ESA/TLE for production.
+    Produce an overpass schedule CSV according to the configured planner mode:
+      - backfill  : demo mode, past N days at ~10:30 UTC
+      - esa_plan  : parse a local ESA Acquisition Plan CSV (config: satellite_tracking.esa_csv_path)
+      - tle       : propagate S2A/S2B overpasses using TLEs for tile centers
+    Output schema: tile_id, satellite, start_time_utc, end_time_utc
     """
-    tiles = cfg["satellite_tracking"].get("tiles", ["T30SUJ"])
-    window_min = int(cfg["satellite_tracking"].get("overpass_window_minutes", 5))
-    days_back = int(cfg["satellite_tracking"].get("prediction_days", 5))
+    st_cfg = cfg.get("satellite_tracking", {})
+    mode = st_cfg.get("mode", "backfill").lower()
+    tiles = st_cfg.get("tiles", ["T30SUJ"])
+    window_min = int(st_cfg.get("overpass_window_minutes", 5))
+    ensure_dir(out_csv.parent)
+
+    if mode == "esa_plan":
+        # Expect a pre-downloaded ESA plan CSV with at least columns: tile_id, start_time_utc, end_time_utc [,satellite]
+        esa_csv = st_cfg.get("esa_csv_path", "plan/esa_acquisition_plan.csv")
+        p = Path(esa_csv)
+        if not p.exists():
+            logger.warning(f"ESA plan CSV not found at {p}. Falling back to backfill.")
+            mode = "backfill"
+        else:
+            df = pd.read_csv(p)
+            # Normalize columns if needed
+            # Try to map common ESA headers to expected names
+            colmap = {}
+            for cand in ["tile_id", "Tile", "Tile ID", "TileID"]:
+                if cand in df.columns:
+                    colmap[cand] = "tile_id"; break
+            for cand in ["start_time_utc", "StartTimeUTC", "StartUTC", "start_time"]:
+                if cand in df.columns:
+                    colmap[cand] = "start_time_utc"; break
+            for cand in ["end_time_utc", "EndTimeUTC", "EndUTC", "end_time"]:
+                if cand in df.columns:
+                    colmap[cand] = "end_time_utc"; break
+            for cand in ["satellite", "Platform", "Satellite"]:
+                if cand in df.columns:
+                    colmap[cand] = "satellite"; break
+
+            if "tile_id" not in colmap or "start_time_utc" not in colmap or "end_time_utc" not in colmap:
+                logger.warning("ESA plan CSV missing required columns; expected tile/time fields. Falling back to backfill.")
+                mode = "backfill"
+            else:
+                df = df.rename(columns=colmap)
+                # Filter by configured tiles
+                df = df[df["tile_id"].astype(str).isin([str(t) for t in tiles])].copy()
+                # Ensure ISO timestamps
+                for c in ["start_time_utc", "end_time_utc"]:
+                    df[c] = pd.to_datetime(df[c], utc=True, errors="coerce").dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                # Default satellite label if missing
+                if "satellite" not in df.columns:
+                    df["satellite"] = "S2"
+                df[["tile_id", "satellite", "start_time_utc", "end_time_utc"]].to_csv(out_csv, index=False)
+                logger.info(f"Wrote ESA-based overpass schedule: {out_csv} ({len(df)} rows)")
+                return
+
+    if mode == "tle":
+        # Use TLEs to compute next passes for tile centers
+        tle_url = st_cfg.get("tle_source", "https://celestrak.org/NORAD/elements/sentinel.txt")
+        days = int(st_cfg.get("prediction_days", 7))
+
+        def _load_tles(url: str) -> Dict[str, List[str]]:
+            try:
+                r = requests.get(url, timeout=20)
+                r.raise_for_status()
+                lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
+                tles = {}
+                i = 0
+                while i < len(lines) - 2:
+                    name = lines[i]
+                    l1 = lines[i + 1]
+                    l2 = lines[i + 2]
+                    if name.upper().startswith("SENTINEL-2A"):
+                        tles["S2A"] = [l1, l2]
+                        i += 3
+                    elif name.upper().startswith("SENTINEL-2B"):
+                        tles["S2B"] = [l1, l2]
+                        i += 3
+                    else:
+                        i += 1
+                return tles
+            except Exception as e:
+                logger.error(f"Failed to fetch TLEs: {e}")
+                return {}
+
+        def _tile_center_from_stac(tile_id: str) -> Optional[Tuple[float, float]]:
+            bbox = _tile_bbox_from_stac(cfg, tile_id)
+            if not bbox:
+                return None
+            minx, miny, maxx, maxy = bbox
+            return ((minx + maxx) / 2.0, (miny + maxy) / 2.0)
+
+        tles = _load_tles(tle_url)
+        if not tles:
+            logger.warning("No TLEs loaded; falling back to backfill.")
+        else:
+            rows = []
+            now = utcnow()
+            for tile in tiles:
+                cen = _tile_center_from_stac(tile)
+                if not cen:
+                    logger.warning(f"Could not resolve center for tile {tile}; skipping")
+                    continue
+                lon, lat = cen
+                # Collect passes for S2A and S2B
+                for sat_name, key in [("S2A", "S2A"), ("S2B", "S2B")]:
+                    if key not in tles:
+                        continue
+                    try:
+                        predictor = get_predictor_from_tle_lines(sat_name, [tles[key][0], tles[key][1]])
+                        passes = predictor.get_next_passes(lat=lat, lon=lon, horizon=days)
+                        for p in passes:
+                            # Prefer max_elevation_date if available; otherwise use aos/los mid
+                            t_center = getattr(p, "max_elevation_date", None)
+                            if t_center is None:
+                                aos = getattr(p, "aos", None)
+                                los = getattr(p, "los", None)
+                                if aos and los:
+                                    t_center = aos + (los - aos) / 2
+                                else:
+                                    t_center = now
+                            start = (t_center - timedelta(minutes=window_min)).astimezone(timezone.utc)
+                            end = (t_center + timedelta(minutes=window_min)).astimezone(timezone.utc)
+                            rows.append({
+                                "tile_id": tile,
+                                "satellite": sat_name,
+                                "start_time_utc": start.isoformat().replace("+00:00", "Z"),
+                                "end_time_utc": end.isoformat().replace("+00:00", "Z")
+                            })
+                    except Exception as e:
+                        logger.warning(f"TLE pass computation failed for {sat_name} {tile}: {e}")
+            if rows:
+                df = pd.DataFrame(rows)
+                df.sort_values(["tile_id", "start_time_utc"], inplace=True)
+                df.to_csv(out_csv, index=False)
+                logger.info(f"Wrote TLE-based overpass schedule: {out_csv} ({len(df)} rows)")
+                return
+            else:
+                logger.warning("No TLE-based passes computed; falling back to backfill.")
+
+    # Backfill (demo)
+    days_back = int(st_cfg.get("prediction_days", 5))
     rows = []
     now = utcnow()
     for day in range(1, days_back + 1):
@@ -112,14 +248,13 @@ def predict_overpasses(cfg: Dict[str, Any], out_csv: Path) -> None:
         for tile in tiles:
             rows.append({
                 "tile_id": tile,
-                "satellite": "S2X",
+                "satellite": "S2",
                 "start_time_utc": (t - timedelta(minutes=window_min)).isoformat(),
                 "end_time_utc": (t + timedelta(minutes=window_min)).isoformat()
             })
     df = pd.DataFrame(rows)
-    ensure_dir(out_csv.parent)
     df.to_csv(out_csv, index=False)
-    logger.info(f"Wrote overpass schedule: {out_csv} ({len(df)} rows)")
+    logger.info(f"Wrote backfilled overpass schedule: {out_csv} ({len(df)} rows)")
 
 
 # --------------------------
