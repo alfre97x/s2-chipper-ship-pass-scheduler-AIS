@@ -90,6 +90,7 @@ def start_end_to_end_worker(
     max_chips: int,
     limit_ships: Optional[int],
     include_swir: bool,
+    restrict_to_schedule: bool,
     stop_event: threading.Event
 ):
     try:
@@ -99,6 +100,7 @@ def start_end_to_end_worker(
             max_chips=max_chips,
             limit_ships=limit_ships,
             include_swir=include_swir,
+            restrict_to_schedule=restrict_to_schedule,
             stop_event=stop_event,
         )
     except Exception as e:
@@ -115,6 +117,7 @@ def start_continuous_worker(
     limit_ships: Optional[int],
     max_chips: Optional[int],
     loop_minutes: int,
+    restrict_to_schedule: bool,
     stop_event: threading.Event
 ):
     """
@@ -132,6 +135,7 @@ def start_continuous_worker(
                     max_chips=int(max_chips) if max_chips else 0 or 0,
                     limit_ships=int(limit_ships) if limit_ships else None,
                     include_swir=include_swir,
+                    restrict_to_schedule=restrict_to_schedule,
                     stop_event=stop_event,
                 )
             except Exception as e:
@@ -296,6 +300,7 @@ def main():
     # Limits
     st.sidebar.markdown("Limits")
     limit_ships = st.sidebar.number_input("Max AIS ships to process", min_value=0, max_value=10000, value=50, step=5)
+    restrict_to_schedule = st.sidebar.checkbox("Restrict to schedule (predictive)", value=False, help="Collect AIS only within active overpass tiles and windows")
     bind_caps = st.sidebar.checkbox("Bind chips cap to ships cap (1:1)", value=True)
     if bind_caps:
         max_chips = limit_ships if limit_ships and limit_ships > 0 else 10
@@ -366,6 +371,7 @@ def main():
                 max_chips=int(max_chips),
                 limit_ships=int(limit_ships) if limit_ships and limit_ships > 0 else None,
                 include_swir=bool(include_swir),
+                restrict_to_schedule=bool(restrict_to_schedule),
             )
         else:
             # Continuous: launch dedicated loop worker (real AIS only)
@@ -381,6 +387,7 @@ def main():
                         limit_ships=int(limit_ships) if limit_ships and limit_ships > 0 else None,
                         max_chips=int(max_chips),
                         loop_minutes=int(loop_every_min or 15),
+                        restrict_to_schedule=bool(restrict_to_schedule),
                         stop_event=st.session_state.stop_event,
                     ),
                     daemon=True,

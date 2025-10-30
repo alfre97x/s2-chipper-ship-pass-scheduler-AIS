@@ -126,10 +126,58 @@ def predict_overpasses(cfg: Dict[str, Any], out_csv: Path) -> None:
 # AIS collection (aisstream or dry-run)
 # --------------------------
 
-def collect_ais_for_schedule(cfg: Dict[str, Any], schedule_csv: Path, window_min: int = 5, out_dir: Optional[Path] = None, dry_run: bool = False) -> Path:
+def _parse_tile_id(tile_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse Sentinel-2 tile id like 'T30SUJ' into zone/lat band/grid square components
+    T + UTM Zone(2 digits) + Latitude Band(1 letter) + Grid Square(2 letters)
+    """
+    try:
+        tid = tile_id.strip().upper()
+        if not tid.startswith("T") or len(tid) < 6:
+            return None
+        zone = int(tid[1:3])
+        lat_band = tid[3]
+        grid_square = tid[4:6]
+        return {"utm_zone": zone, "lat_band": lat_band, "grid_square": grid_square}
+    except Exception:
+        return None
+
+
+def _tile_bbox_from_stac(cfg: Dict[str, Any], tile_id: str) -> Optional[List[float]]:
+    """
+    Resolve a tile's geographic bbox via STAC by querying s2:utm_zone/s2:latitude_band/s2:grid_square.
+    Returns [minLon, minLat, maxLon, maxLat] or None.
+    """
+    try:
+        comp = _parse_tile_id(tile_id)
+        if not comp:
+            return None
+        client = Client.open(cfg["stac"]["primary_endpoint"], ignore_conformance=True)
+        search = client.search(
+            collections=[cfg["stac"].get("collection", "sentinel-2-l2a")],
+            query={
+                "s2:utm_zone": {"eq": comp["utm_zone"]},
+                "s2:latitude_band": {"eq": comp["lat_band"]},
+                "s2:grid_square": {"eq": comp["grid_square"]},
+            },
+            max_items=1,
+        )
+        items = list(search.items())
+        if not items:
+            return None
+        return list(items[0].bbox)  # [minLon, minLat, maxLon, maxLat]
+    except Exception as e:
+        logger.warning(f"Failed to resolve bbox for {tile_id}: {e}")
+        return None
+
+
+def collect_ais_for_schedule(cfg: Dict[str, Any], schedule_csv: Path, window_min: int = 5, out_dir: Optional[Path] = None, dry_run: bool = False, restrict_to_schedule: bool = False) -> Path:
     """
     Collect AIS around scheduled overpasses. If AISSTREAM_API_KEY is missing or dry_run=True,
     generate synthetic AIS around a test AOI.
+
+    If restrict_to_schedule=True (predictive mode): subscribe only to bounding boxes of tiles
+    whose overpass window is currently active; otherwise subscribe globally.
     """
     api_key = os.getenv("AISSTREAM_API_KEY")
     date_str = fmt_date(utcnow())
@@ -137,20 +185,47 @@ def collect_ais_for_schedule(cfg: Dict[str, Any], schedule_csv: Path, window_min
     ensure_dir(out_dir)
 
     schedule = pd.read_csv(schedule_csv, parse_dates=["start_time_utc", "end_time_utc"])
-    # Keep only windows that intersect now (MVP) or just the first window for demo
     if schedule.empty:
         raise RuntimeError("Empty overpass schedule")
-    # For simplicity, take the first row for demo collection
-    row = schedule.iloc[0]
-    start_t = pd.to_datetime(row["start_time_utc"], utc=True)
-    end_t = pd.to_datetime(row["end_time_utc"], utc=True)
-    tile_id = row["tile_id"]
+
+    now = utcnow()
+    active = schedule[(schedule["start_time_utc"] <= now) & (now <= schedule["end_time_utc"])].copy()
+
+    # Compute time left in active window (min over all active rows)
+    if not active.empty:
+        time_left_secs = max(1, int((active["end_time_utc"].min() - now).total_seconds()))
+    else:
+        # Fallback to a short window if nothing is active
+        time_left_secs = int(max(1, window_min) * 60)
+
+    # Resolve tile bounding boxes for active windows (predictive-only mode)
+    bboxes: List[Tuple[str, List[float]]] = []
+    if restrict_to_schedule and not active.empty:
+        for tid in active["tile_id"].astype(str).unique():
+            bbox = _tile_bbox_from_stac(cfg, tid)
+            if bbox:
+                bboxes.append((tid, bbox))
+        if not bboxes:
+            logger.warning("No tile bboxes could be resolved for active windows; falling back to global subscription")
+            restrict_to_schedule = False
+    # If not restricting or no active windows, we'll subscribe globally
 
     if dry_run or not api_key:
-        # Generate synthetic AIS around Gibraltar to exercise the pipeline
+        # Generate synthetic AIS around an example AOI (kept for testing)
         center_lat, center_lon = 36.1, -5.4
         n = 50
         ships = []
+        # Pick first active window if present, else synthesize a time window
+        if not active.empty:
+            row0 = active.iloc[0]
+            start_t = pd.to_datetime(row0["start_time_utc"], utc=True)
+            end_t = pd.to_datetime(row0["end_time_utc"], utc=True)
+            tile_id = str(row0["tile_id"])
+        else:
+            start_t = now
+            end_t = now + timedelta(minutes=window_min)
+            tile_id = "UNKNOWN"
+
         for i in range(n):
             mmsi = str(200000000 + i)
             lat = center_lat + random.uniform(-0.3, 0.3)
@@ -163,7 +238,7 @@ def collect_ais_for_schedule(cfg: Dict[str, Any], schedule_csv: Path, window_min
                 "tile_id": tile_id,
                 "overpass_time": start_t.isoformat(),
                 "captured_time": ts.isoformat(),
-                "source": "predictive",
+                "source": "predictive" if restrict_to_schedule else "opportunistic",
                 "provider": "dry_run"
             })
         df = pd.DataFrame(ships)
@@ -185,12 +260,22 @@ def collect_ais_for_schedule(cfg: Dict[str, Any], schedule_csv: Path, window_min
 
         async def listen():
             url = "wss://stream.aisstream.io/v0/stream"
-            ships: Dict[str, Dict[str, Any]] = {}
-            bbox = []  # empty == global
+            # Per-tile ship accumulators
+            ships_by_tile: Dict[str, Dict[str, Any]] = {}
+            # Build bounding boxes payload
+            if restrict_to_schedule and bboxes:
+                bb_payload = [[bb[1][0], bb[1][1], bb[1][2], bb[1][3]] for bb in bboxes]
+            else:
+                bb_payload = []  # global
+
+            def point_in_bbox(lon: float, lat: float, bbox: List[float]) -> bool:
+                minx, miny, maxx, maxy = bbox
+                return (minx <= lon <= maxx) and (miny <= lat <= maxy)
+
             try:
                 async with websockets.connect(url, ping_interval=None) as ws:
-                    await ws.send(pyjson.dumps({"APIKey": api_key, "BoundingBoxes": bbox}))
-                    t_end = time.time() + (window_min * 60)
+                    await ws.send(pyjson.dumps({"APIKey": api_key, "BoundingBoxes": bb_payload}))
+                    t_end = time.time() + time_left_secs
                     while time.time() < t_end:
                         msg = pyjson.loads(await ws.recv())
                         ais = msg.get("Message", {}).get("PositionReport", {})
@@ -200,35 +285,55 @@ def collect_ais_for_schedule(cfg: Dict[str, Any], schedule_csv: Path, window_min
                         lat = ais.get("Latitude")
                         lon = ais.get("Longitude")
                         ts = ais.get("TimeUTC") or utcnow().isoformat()
-                        if mmsi and lat and lon:
-                            ships[mmsi] = {
-                                "mmsi": mmsi,
-                                "lat": float(lat),
-                                "lon": float(lon),
-                                "tile_id": tile_id,
-                                "overpass_time": start_t.isoformat(),
-                                "captured_time": ts,
-                                "source": "predictive",
-                                "provider": "aisstream"
-                            }
+                        if not (mmsi and lat and lon):
+                            continue
+
+                        # Assign to tile_id based on bbox match (first match wins); if none, skip in predictive mode
+                        assigned_tile = None
+                        if restrict_to_schedule and bboxes:
+                            for tid, bb in bboxes:
+                                if point_in_bbox(float(lon), float(lat), bb):
+                                    assigned_tile = tid
+                                    break
+                            if not assigned_tile:
+                                continue
+                        else:
+                            # fallback: if active window exists, tag first active tile; else UNKNOWN
+                            assigned_tile = str(active.iloc[0]["tile_id"]) if not active.empty else "UNKNOWN"
+
+                        ships_by_tile.setdefault(assigned_tile, {})
+                        ships_by_tile[assigned_tile][mmsi] = {
+                            "mmsi": mmsi,
+                            "lat": float(lat),
+                            "lon": float(lon),
+                            "tile_id": assigned_tile,
+                            "overpass_time": (active.iloc[0]["start_time_utc"].isoformat() if not active.empty else utcnow().isoformat()),
+                            "captured_time": ts,
+                            "source": "predictive" if restrict_to_schedule else "opportunistic",
+                            "provider": "aisstream"
+                        }
             except Exception as e:
                 logger.error(f"AIS stream error: {e}")
 
-            df = pd.DataFrame(list(ships.values()))
-            out_path = out_dir / f"ais_overpass_{tile_id}.parquet"
-            if not df.empty:
-                df.to_parquet(out_path, index=False)
-                # Also write Excel snapshot for resilience
-                try:
-                    out_xlsx = out_path.with_suffix(".xlsx")
-                    df.to_excel(out_xlsx, index=False)
-                except Exception as e:
-                    logger.warning(f"Failed writing Excel AIS snapshot: {e}")
-                logger.info(f"Wrote AIS sample: {out_path} ({len(df)} rows)")
+            # Write per-tile outputs; return the first parquet path for downstream compatibility
+            first_out: Optional[Path] = None
+            if ships_by_tile:
+                for tid, ship_map in ships_by_tile.items():
+                    df = pd.DataFrame(list(ship_map.values()))
+                    out_path = out_dir / f"ais_overpass_{tid}.parquet"
+                    df.to_parquet(out_path, index=False)
+                    try:
+                        out_xlsx = out_path.with_suffix(".xlsx")
+                        df.to_excel(out_xlsx, index=False)
+                    except Exception as e:
+                        logger.warning(f"Failed writing Excel AIS snapshot: {e}")
+                    logger.info(f"Wrote AIS sample for tile {tid}: {out_path} ({len(df)} rows)")
+                    if first_out is None:
+                        first_out = out_path
+                return first_out  # type: ignore
             else:
                 # Fallback to synthetic if we failed to collect
                 return collect_ais_for_schedule(cfg, schedule_csv, window_min, out_dir, dry_run=True)
-            return out_path
 
         return asyncio.get_event_loop().run_until_complete(listen())
 
@@ -663,6 +768,7 @@ def run_end_to_end(
     max_chips: int = 10,
     limit_ships: Optional[int] = None,
     include_swir: bool = True,
+    restrict_to_schedule: bool = False,
     stop_event: Optional[Any] = None
 ) -> None:
     """
@@ -674,7 +780,13 @@ def run_end_to_end(
     predict_overpasses(cfg, schedule_csv)
 
     # 2) Collect AIS (synthetic by default)
-    ais_path = collect_ais_for_schedule(cfg, schedule_csv, window_min=cfg["satellite_tracking"].get("overpass_window_minutes", 5), dry_run=dry_run_ais)
+    ais_path = collect_ais_for_schedule(
+        cfg,
+        schedule_csv,
+        window_min=cfg["satellite_tracking"].get("overpass_window_minutes", 5),
+        dry_run=dry_run_ais,
+        restrict_to_schedule=restrict_to_schedule
+    )
 
     # 3) For each AIS point, find best scene and chip
     ais_df = pd.read_parquet(ais_path)
