@@ -1,0 +1,69 @@
+# Global configuration for Sentinel-2 Ship Chips pipeline
+
+satellite_tracking:
+  mode: "esa_plan"        # esa_plan | tle
+  tiles: ["T30SUJ"]       # MGRS tiles to track (example)
+  tle_source: "https://celestrak.org/NORAD/elements/sentinel.txt"
+  prediction_days: 7
+  overpass_window_minutes: 5
+  min_elevation_deg: 10
+
+ais:
+  provider: "aisstream"
+  random_sampling_per_day: 500
+  write_batch_size: 500
+  reconnect_seconds: 5
+  # optional: global or regional bounding boxes for random sampling; empty means global
+  random_bounding_boxes: []
+
+stac:
+  primary_endpoint: "https://earth-search.aws.element84.com/v1"
+  collection: "sentinel-2-l2a"
+  cloud_cover_max: 30
+  search_window_hours: 24
+  max_items_per_overpass: 5
+
+scheduler:
+  lag_days_l2a: 3
+
+tiling:
+  chip_size_px: 256
+  gsd_m: 10
+  bands_core: ["B02", "B03", "B04", "B08"]
+  bands_swir: ["B11", "B12"]
+  resample_swir_to_10m: true
+  resample_method: "bicubic"
+
+masks:
+  use_scl: true
+  derive_water_via_ndwi: true
+  scl_classes_exclude: ["clouds", "cirrus", "cloud_shadows"]
+
+# AIS+sanity gate to keep only tiles where the AIS point is plausibly over water and not cloud/land occluded
+gate:
+  enabled: true
+  center_window_px: 64
+  max_cloud_center_frac: 0.05
+  max_land_center_frac: 0.2
+  ndwi_water_thresh: 0.05
+  min_water_center_frac: 0.5
+
+storage:
+  root: "./dataset_root"
+  layout:
+    chips: "chips/{split}/{mmsi}/{date}/{chip_id}.tif"
+    chip_geojson: "chips/{split}/{mmsi}/{date}/{chip_id}.geojson"
+    chip_meta: "chips/{split}/{mmsi}/{date}/{chip_id}.json"
+    chip_quicklook: "chips/{split}/{mmsi}/{date}/{chip_id}_quicklook.jpg"
+    daily_tiles_geojson: "indexes/tiles_{date}.geojson"
+    tiles_index: "indexes/tiles.parquet"
+    ais_index: "indexes/ais_observations.parquet"
+    qa_report: "QA/reports/{date}.html"
+
+splits:
+  train: 0.8
+  val: 0.1
+  test: 0.1
+
+logging:
+  level: "INFO"
