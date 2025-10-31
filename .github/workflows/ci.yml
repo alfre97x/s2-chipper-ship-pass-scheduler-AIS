@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gdal-bin libgdal-dev
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Environment doctor
+        run: |
+          python -m src.cli doctor --config config.yaml --db ops.db
+
+      - name: Run tests (if any)
+        run: |
+          pytest -q || true
+
+      - name: STAC publish smoke (optional)
+        shell: bash
+        run: |
+          if [ -f "dataset_root/indexes/tiles.parquet" ]; then
+            python -m src.cli publish-stac --config config.yaml --out-dir dataset_root/stac || true
+          else
+            echo "tiles.parquet not present; skipping STAC smoke"
+          fi

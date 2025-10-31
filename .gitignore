@@ -26,6 +26,7 @@ dataset_root/
 ais/
 
 # Logs
+logs/
 *.log
 
 # Python packaging

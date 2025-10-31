@@ -12,6 +12,7 @@ rasterio
 Pillow
 requests
 pystac-client
+pystac
 tqdm
 loguru
 websockets

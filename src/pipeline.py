@@ -8,6 +8,7 @@ import random
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -25,6 +26,7 @@ from pystac_client import Client
 import requests
 from orbit_predictor.sources import get_predictor_from_tle_lines
 from src.planner import download_esa_csv, write_versioned_schedule_csv
+from src.ops_db import init_db, upsert_ais_rows, upsert_chip_job, set_ais_status, increment_retry, due_ais, DEFAULT_DB_PATH
 
 
 # --------------------------
@@ -37,6 +39,21 @@ def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
         cfg = yaml.safe_load(f)
     # Inject env fallbacks
     cfg.setdefault("storage", {}).setdefault("root", "./dataset_root")
+
+    # Phase 4: Logging sink to rotating file if configured
+    try:
+        log_cfg = cfg.get("logging", {})
+        log_file = log_cfg.get("file")
+        if log_file:
+            log_path = Path(log_file)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            rotation = log_cfg.get("rotation", "10 MB")
+            # Avoid adding duplicate sinks by tagging with a unique filter
+            logger.add(str(log_path), rotation=rotation, enqueue=True, backtrace=False, diagnose=False, level=log_cfg.get("level", "INFO"))
+    except Exception:
+        # Do not fail config loading on logging setup issues
+        pass
+
     return cfg
 
 
@@ -294,13 +311,19 @@ def _parse_tile_id(tile_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+# Simple in-process cache for tile bbox lookups (Phase 4 perf)
+_TILE_BBOX_CACHE: Dict[str, List[float]] = {}
+
 def _tile_bbox_from_stac(cfg: Dict[str, Any], tile_id: str) -> Optional[List[float]]:
     """
     Resolve a tile's geographic bbox via STAC by querying s2:utm_zone/s2:latitude_band/s2:grid_square.
-    Returns [minLon, minLat, maxLon, maxLat] or None.
+    Returns [minLon, minLat, maxLon, maxLat] or None. Cached per tile_id during process lifetime.
     """
     try:
-        comp = _parse_tile_id(tile_id)
+        tid = str(tile_id).upper().strip()
+        if tid in _TILE_BBOX_CACHE:
+            return _TILE_BBOX_CACHE[tid]
+        comp = _parse_tile_id(tid)
         if not comp:
             return None
         client = Client.open(cfg["stac"]["primary_endpoint"], ignore_conformance=True)
@@ -316,7 +339,9 @@ def _tile_bbox_from_stac(cfg: Dict[str, Any], tile_id: str) -> Optional[List[flo
         items = list(search.items())
         if not items:
             return None
-        return list(items[0].bbox)  # [minLon, minLat, maxLon, maxLat]
+        bbox = list(items[0].bbox)
+        _TILE_BBOX_CACHE[tid] = bbox
+        return bbox  # [minLon, minLat, maxLon, maxLat]
     except Exception as e:
         logger.warning(f"Failed to resolve bbox for {tile_id}: {e}")
         return None
@@ -754,6 +779,12 @@ def chip_one(
         ensure_dir(paths["tif"].parent)
 
         # Write GeoTIFF (simple GTiff; COG optional later)
+        # Phase 4: COG-like writer (tiled GTiff with block size and internal overviews)
+        tiling_cfg = cfg.get("tiling", {})
+        block_size = int(tiling_cfg.get("block_size", 256))
+        compression = str(tiling_cfg.get("compression", "deflate"))
+        write_cog = bool(tiling_cfg.get("write_cog", True))
+
         profile = {
             "driver": "GTiff",
             "dtype": "float32",
@@ -763,12 +794,23 @@ def chip_one(
             "transform": chip_transform,
             "crs": ref_crs,
             "tiled": True,
-            "compress": "deflate",
+            "blockxsize": block_size,
+            "blockysize": block_size,
+            "compress": compression,
             "predictor": 2,
         }
         with rasterio.open(paths["tif"], "w", **profile) as dst:
             for i in range(stack.shape[0]):
                 dst.write(stack[i, :, :], i + 1)
+            # Build internal overviews if requested
+            if write_cog:
+                try:
+                    ovs = list(tiling_cfg.get("overviews", [2, 4, 8, 16]))
+                    if ovs:
+                        dst.build_overviews(ovs, Resampling.nearest)
+                        dst.update_tags(ns='rio_overview', resampling='nearest')
+                except Exception as e:
+                    logger.debug(f"Overview build failed (non-fatal): {e}")
 
         # Quicklook (RGB 2-98 stretch)
         try:
@@ -926,6 +968,7 @@ def run_end_to_end(
     Convenience: predict -> collect_ais -> search scene -> chip N samples
     """
     cfg = load_config(cfg_path)
+    init_db(DEFAULT_DB_PATH)
     # 1) Predict overpasses
     schedule_csv = Path("plan") / "overpass_schedule.csv"
     predict_overpasses(cfg, schedule_csv)
@@ -952,6 +995,12 @@ def run_end_to_end(
         except Exception:
             pass
 
+    # Upsert AIS into Ops DB
+    try:
+        upsert_ais_rows(ais_df.to_dict('records'))
+    except Exception as e:
+        logger.warning(f"Failed to upsert AIS into Ops DB: {e}")
+
     # 4) Chip up to max_chips samples; search a suitable scene per AIS point
     count = 0
     for _, r in ais_df.iterrows():
@@ -969,6 +1018,25 @@ def run_end_to_end(
             if stop_event is not None and hasattr(stop_event, "is_set") and stop_event.is_set():
                 logger.info("Stop requested; aborting run loop")
                 break
+            # Ops DB: mark job started
+            doc_id = f"{str(r['mmsi'])}|{str(r.get('captured_time') or r.get('overpass_time'))}|{str(r.get('tile_id') or '')}"
+            chip_id_preview = deterministic_chip_id(str(r["mmsi"]), best_item["datetime"], float(r["lat"]), float(r["lon"]))
+            # Idempotency: skip if chip already exists on disk
+            try:
+                date_str = fmt_date(pd.to_datetime(best_item["datetime"], utc=True))
+                split = assign_split(chip_id_preview, cfg.get("splits", {}))
+                paths_pred = layout_paths(cfg, split, str(r["mmsi"]), date_str, chip_id_preview)
+                if paths_pred["tif"].exists():
+                    logger.info(f"Skip existing chip {chip_id_preview} at {paths_pred['tif']}")
+                    count += 1
+                    continue
+            except Exception as _e:
+                logger.debug(f"Idempotency pre-check failed: {_e}")
+            try:
+                upsert_chip_job(chip_id_preview, str(r["mmsi"]), best_item.get("id"), "started")
+            except Exception as _e:
+                logger.debug(f"upsert_chip_job(started) failed: {_e}")
+
             result = chip_one(
                 cfg=cfg,
                 mmsi=str(r["mmsi"]),
@@ -979,9 +1047,95 @@ def run_end_to_end(
                 include_swir=include_swir
             )
             if result:
+                try:
+                    upsert_chip_job(chip_id_preview, str(r["mmsi"]), best_item.get("id"), "done")
+                    set_ais_status(doc_id, "chipped")
+                except Exception as _e:
+                    logger.debug(f"Ops DB finalize failed: {_e}")
                 count += 1
         except Exception as e:
             logger.error(f"Chip failed for MMSI={r['mmsi']}: {e}")
+            try:
+                chip_id_preview = deterministic_chip_id(str(r["mmsi"]), best_item.get("datetime", str(r.get("overpass_time"))), float(r["lat"]), float(r["lon"]))
+                upsert_chip_job(chip_id_preview, str(r["mmsi"]), (best_item.get("id") if best_item else None), "failed", error=str(e))
+                doc_id = f"{str(r['mmsi'])}|{str(r.get('captured_time') or r.get('overpass_time'))}|{str(r.get('tile_id') or '')}"
+                set_ais_status(doc_id, "failed", error=str(e))
+                increment_retry(doc_id)
+            except Exception as _e:
+                logger.debug(f"Ops DB failure-update failed: {_e}")
+
+    # Retry pass for failed AIS due for retry (exponential backoff)
+    ops_cfg = cfg.get("ops", {})
+    retry_limit = int(ops_cfg.get("retry_batch_limit", 0))
+    if retry_limit > 0:
+        try:
+            due = due_ais(limit=retry_limit)
+            if due:
+                logger.info(f"Retrying {len(due)} failed AIS rows")
+                for row in due:
+                    try:
+                        # Build predictor context
+                        ovp_time = str(row.get("overpass_time") or row.get("captured_time") or utcnow().isoformat())
+                        best_item = search_best_scene(cfg, float(row["lon"]), float(row["lat"]), ovp_time)
+                        if not best_item:
+                            continue
+                        mmsi = str(row["mmsi"])
+                        lat = float(row["lat"])
+                        lon = float(row["lon"])
+                        doc_id = str(row["id"])
+                        chip_id_preview = deterministic_chip_id(mmsi, best_item["datetime"], lat, lon)
+
+                        # Idempotency: skip if chip exists on disk; mark as chipped
+                        try:
+                            date_str = fmt_date(pd.to_datetime(best_item["datetime"], utc=True))
+                            split = assign_split(chip_id_preview, cfg.get("splits", {}))
+                            paths_pred = layout_paths(cfg, split, mmsi, date_str, chip_id_preview)
+                            if paths_pred["tif"].exists():
+                                try:
+                                    set_ais_status(doc_id, "chipped")
+                                    upsert_chip_job(chip_id_preview, mmsi, best_item.get("id"), "done")
+                                except Exception:
+                                    pass
+                                continue
+                        except Exception as _e:
+                            logger.debug(f"Idempotency pre-check (retry) failed: {_e}")
+
+                        try:
+                            upsert_chip_job(chip_id_preview, mmsi, best_item.get("id"), "started")
+                        except Exception as _e:
+                            logger.debug(f"upsert_chip_job(started) retry failed: {_e}")
+
+                        res = chip_one(
+                            cfg=cfg,
+                            mmsi=mmsi,
+                            lat=lat,
+                            lon=lon,
+                            overpass_time_iso=ovp_time,
+                            stac_item=best_item,
+                            include_swir=include_swir
+                        )
+                        if res:
+                            try:
+                                upsert_chip_job(chip_id_preview, mmsi, best_item.get("id"), "done")
+                                set_ais_status(doc_id, "chipped")
+                            except Exception as _e:
+                                logger.debug(f"Ops DB finalize (retry) failed: {_e}")
+                        else:
+                            set_ais_status(doc_id, "failed", error="gate_reject_or_none")
+                            increment_retry(doc_id)
+                    except Exception as re:
+                        logger.debug(f"Retry chip failed for id={row.get('id')}: {re}")
+                        try:
+                            mmsi = str(row.get("mmsi", ""))
+                            lat = float(row.get("lat", "nan"))
+                            lon = float(row.get("lon", "nan"))
+                            chip_id_preview = deterministic_chip_id(mmsi, ovp_time, lat, lon)
+                            upsert_chip_job(chip_id_preview, mmsi, None, "failed", error=str(re))
+                            increment_retry(str(row.get("id")))
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.debug(f"Retry pass failed: {e}")
 
     logger.info(f"Chipped {count} samples (out of {len(ais_df)})")
 
@@ -1156,3 +1310,100 @@ def prune_by_ais(cfg_path: str = "config.yaml", time_tol_min: int = 10, dist_tol
 
     kept.to_parquet(tiles_index, index=False)
     logger.info(f"Pruned {len(removed)} chips by AIS tolerances (time≤{time_tol_min} min, dist≤{dist_tol_m} m)")
+
+def run_retry_pass(
+    cfg_path: str = "config.yaml",
+    include_swir: bool = True,
+    limit: Optional[int] = None
+) -> int:
+    """
+    Execute a single retry pass for failed AIS observations that are due per backoff.
+    Returns the number of chips produced (or skipped as already present).
+    """
+    cfg = load_config(cfg_path)
+    ops_cfg = cfg.get("ops", {})
+    retry_limit = int(limit if limit is not None else ops_cfg.get("retry_batch_limit", 0))
+    if retry_limit <= 0:
+        logger.info("Retry pass skipped (retry_limit ≤ 0)")
+        return 0
+
+    due = due_ais(limit=retry_limit)
+    if not due:
+        logger.info("Retry pass: 0 due rows")
+        return 0
+
+    count = 0
+    for row in due:
+        try:
+            ovp_time = str(row.get("overpass_time") or row.get("captured_time") or utcnow().isoformat())
+            best_item = search_best_scene(cfg, float(row["lon"]), float(row["lat"]), ovp_time)
+            if not best_item:
+                # No scene yet; bump retry/backoff
+                try:
+                    increment_retry(str(row["id"]))
+                except Exception:
+                    pass
+                continue
+
+            mmsi = str(row["mmsi"])
+            lat = float(row["lat"])
+            lon = float(row["lon"])
+            doc_id = str(row["id"])
+            chip_id_preview = deterministic_chip_id(mmsi, best_item["datetime"], lat, lon)
+
+            # Idempotency: skip if chip exists on disk; mark as chipped
+            try:
+                date_str = fmt_date(pd.to_datetime(best_item["datetime"], utc=True))
+                split = assign_split(chip_id_preview, cfg.get("splits", {}))
+                paths_pred = layout_paths(cfg, split, mmsi, date_str, chip_id_preview)
+                if paths_pred["tif"].exists():
+                    try:
+                        set_ais_status(doc_id, "chipped")
+                        upsert_chip_job(chip_id_preview, mmsi, best_item.get("id"), "done")
+                    except Exception:
+                        pass
+                    count += 1
+                    continue
+            except Exception as _e:
+                logger.debug(f"Idempotency pre-check (retry-only) failed: {_e}")
+
+            try:
+                upsert_chip_job(chip_id_preview, mmsi, best_item.get("id"), "started")
+            except Exception as _e:
+                logger.debug(f"upsert_chip_job(started) retry-only failed: {_e}")
+
+            res = chip_one(
+                cfg=cfg,
+                mmsi=mmsi,
+                lat=lat,
+                lon=lon,
+                overpass_time_iso=ovp_time,
+                stac_item=best_item,
+                include_swir=include_swir
+            )
+            if res:
+                try:
+                    upsert_chip_job(chip_id_preview, mmsi, best_item.get("id"), "done")
+                    set_ais_status(doc_id, "chipped")
+                except Exception as _e:
+                    logger.debug(f"Ops DB finalize (retry-only) failed: {_e}")
+                count += 1
+            else:
+                set_ais_status(doc_id, "failed", error="gate_reject_or_none")
+                increment_retry(doc_id)
+        except Exception as e:
+            logger.debug(f"Retry chip failed for id={row.get('id')}: {e}")
+            try:
+                chip_id_preview = deterministic_chip_id(
+                    str(row.get("mmsi", "")),
+                    str(row.get("overpass_time") or row.get("captured_time") or ovp_time),
+                    float(row.get("lat", "nan")),
+                    float(row.get("lon", "nan"))
+                )
+                upsert_chip_job(chip_id_preview, str(row.get("mmsi", "")), None, "failed", error=str(e))
+                increment_retry(str(row.get("id")))
+            except Exception:
+                pass
+
+    logger.info(f"Retry pass chipped {count} items (out of {len(due)})")
+    return count

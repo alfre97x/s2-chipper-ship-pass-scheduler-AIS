@@ -36,6 +36,11 @@ tiling:
   bands_swir: ["B11", "B12"]
   resample_swir_to_10m: true
   resample_method: "bicubic"
+  # Phase 4: COG/IO tuning
+  write_cog: true             # write chips as tiled GTiff with internal overviews (COG-like)
+  block_size: 256             # internal tile/block size
+  overviews: [2, 4, 8, 16]    # internal overview pyramid factors
+  compression: "deflate"      # deflate|zstd (ensure driver support)
 
 masks:
   use_scl: true
@@ -70,3 +75,16 @@ splits:
 
 logging:
   level: "INFO"
+  file: "logs/run.log"       # Phase 4: structured rotating file logs
+  rotation: "10 MB"
+
+ops:
+  max_retries: 5
+  initial_backoff_min: 5
+  max_backoff_hours: 24
+  retry_batch_limit: 50
+  parallel_chips: 1          # Phase 4: reserved for future parallel chipping (keep 1 for safety)
+
+alerts:
+  webhook_url: ""
+  threshold_fail_rate: 0.5

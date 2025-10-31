@@ -23,7 +23,9 @@ from src.pipeline import (
     run_end_to_end,
     prune_by_ais,
     chip_from_table,
+    run_retry_pass,
 )
+from src.qa_report import generate_qa_report
 
 APP_TITLE = "S2 Ship Chips — Control Panel"
 
@@ -344,6 +346,19 @@ def main():
 
     prune_clicked = st.sidebar.button("Prune by AIS (delete mismatches)")
 
+    # Ops controls
+    st.sidebar.markdown("---")
+    st.sidebar.header("Ops Controls")
+    ops_retry_limit = st.sidebar.number_input(
+        "Retry pass limit",
+        min_value=0,
+        max_value=10000,
+        value=int(cfg.get("ops", {}).get("retry_batch_limit", 50)),
+        step=10,
+    )
+    ops_retry_clicked = st.sidebar.button("Run Retry Pass")
+    qa_report_clicked = st.sidebar.button("Generate QA Report")
+
     # Handle actions
     # Write overrides to a temp config so pipeline picks them up
     overrides = {
@@ -406,6 +421,21 @@ def main():
             st.sidebar.success("Prune completed.")
         except Exception as e:
             st.sidebar.error(f"Prune error: {e}")
+
+    # Ops actions
+    if ops_retry_clicked:
+        try:
+            produced = run_retry_pass(cfg_path=runtime_cfg, include_swir=bool(include_swir), limit=int(ops_retry_limit))
+            st.sidebar.success(f"Retry pass completed: {produced} items processed")
+        except Exception as e:
+            st.sidebar.error(f"Retry pass error: {e}")
+
+    if qa_report_clicked:
+        try:
+            report_path = generate_qa_report(cfg_path=runtime_cfg)
+            st.sidebar.success(f"QA report generated: {report_path}")
+        except Exception as e:
+            st.sidebar.error(f"QA report error: {e}")
 
     # Chip from uploaded file handler
     if chip_file_clicked:

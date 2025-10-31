@@ -1,4 +1,5 @@
 # Sentinel‑2 Ship Chips — Platform Guide
+[![CI](https://github.com/alfre97x/s2-chipper-ship-pass-scheduler-AIS/actions/workflows/ci.yml/badge.svg)](https://github.com/alfre97x/s2-chipper-ship-pass-scheduler-AIS/actions/workflows/ci.yml) • Docs: [Runbook](docs/Runbook.md) | [STAC](docs/STAC.md) | [CI](docs/CI.md)
 
 End‑to‑end platform to produce “Clay‑ready” 256×256 Sentinel‑2 chips centered on vessels observed by AIS. This guide explains what the platform produces, how it works, and how to operate it in interactive (Streamlit) and scripted (CLI/scheduler) modes. It also documents data formats, configuration, “real AIS only” operation, and predictive (tile‑constrained) collection with ESA/TLE planners.
 
@@ -106,6 +107,46 @@ Environment (.env)
 
 ---
 
+4b) Ops DB lifecycle & retries
+
+What it tracks
+- SQLite ops.db with two tables:
+  - ais_observations(id, mmsi, lat, lon, tile_id, captured_time, overpass_time, source, provider, status, created_at, retry_count, last_error, last_attempt_at, next_retry_at)
+    - id is deterministic: f"{mmsi}|{captured_time or overpass_time}|{tile_id or ''}"
+  - chip_jobs(chip_id, mmsi, scene_id, status, error, created_at, last_attempt_at)
+
+Lifecycle in the pipeline
+1) AIS capture → DB
+   - After collecting AIS (synthetic or real), rows are upserted into ais_observations with status='captured'. Existing status/created_at/retry metadata are preserved.
+2) Start chipping
+   - Before each chip attempt, insert/update chip_jobs with status='started' and bump last_attempt_at.
+3) Success path
+   - On successful chip write: chip_jobs.status='done'; ais_observations.status='chipped'.
+4) Failure path + backoff
+   - On exception or gate reject: chip_jobs.status='failed' with error, ais_observations.status='failed', retry_count++, and next_retry_at computed with exponential backoff:
+     next_retry_at = now + min(initial_backoff_min * 2^retries, max_backoff_hours)
+5) Idempotency
+   - Filesystem pre-check: if the expected chip .tif already exists for the chip_id, skip the attempt and move on. This keeps re-runs safe and cheap.
+
+Retry consumption pass
+- run_end_to_end performs a second pass that queries due_ais(limit) for failed rows whose next_retry_at ≤ now and retries them (bounded by ops.retry_batch_limit). It reuses the same lifecycle and idempotency checks.
+
+Configuration
+- config.yaml:
+  ops:
+    max_retries: 5
+    initial_backoff_min: 5
+    max_backoff_hours: 24
+    retry_batch_limit: 50
+  alerts:
+    webhook_url: ""
+    threshold_fail_rate: 0.5
+
+Notes
+- DB is auto-initialized (init_db) and columns are added with best‑effort ALTER TABLE migrations.
+- Alerts are stubbed in config for future wiring (e.g., send webhook on high failure rate).
+- You can inspect ops.db with any SQLite browser if needed.
+
 5) Streamlit UI (Batch vs Continuous)
 
 Launch the UI
@@ -152,6 +193,11 @@ Prune by AIS
 
 Chip from AIS file (Excel/CSV)
 - Upload a table (schema below) and click “Chip from uploaded file”. Useful for curated/recorded AIS runs or resuming after interruptions/lag.
+
+Ops Controls
+- Retry pass limit: sets the maximum number of failed AIS rows to retry in one pass (bounded by ops.retry_batch_limit).
+- Run Retry Pass: executes a single retry pass using exponential backoff and idempotency checks.
+- Generate QA Report: writes an HTML report (tiles metrics + ops DB status) to storage.layout.qa_report. If alerts.threshold_fail_rate is exceeded and alerts.webhook_url is set, a webhook is posted.
 
 Main panel
 - Status (Idle/Running), Logs (live tail), Quicklook gallery, Footprints map (daily), Index snapshot (tiles.parquet head).
@@ -271,6 +317,63 @@ Scheduling (recommended for production)
 - Optionally: run prune_by_ais afterward
 
 ---
+
+11b) Ops & QA CLI
+
+QA report
+```
+python -m src.cli qa-report --config config.yaml --out dataset_root/QA/reports/manual_report.html
+```
+
+Ops status (DB + tiles)
+```
+python -m src.cli ops-status --config config.yaml --db ops.db
+```
+
+Retry-only pass (respect backoff; override limit if needed)
+```
+python -m src.cli ops-retry --config config.yaml --limit 50 --include-swir
+```
+
+Dataset manifest (lightweight JSON with counts and samples)
+```
+python -m src.cli publish --config config.yaml --out-manifest dataset_root/manifests/dataset_manifest.json --sample-limit 100
+```
+
+11c) STAC publishing and maintenance
+
+STAC publish (relative hrefs)
+```
+python -m src.cli publish-stac --config config.yaml --out-dir dataset_root/stac
+```
+
+STAC publish (absolute hrefs for hosted catalogs)
+```
+python -m src.cli publish-stac --config config.yaml --out-dir dataset_root/stac --absolute-urls --base-url https://example.com/my-dataset
+```
+Notes
+- Output is a STAC Catalog with a single Collection (chips) and one Item per chip.
+- Asset roles include: data (chip GeoTIFF), thumbnail (quicklook JPEG), metadata (meta JSON, footprint GeoJSON).
+- Validate with pystac (built-in validation via pystac; optional external tooling can be used).
+
+Operational health
+- Doctor (config/env/storage/deps check)
+```
+python -m src.cli doctor --config config.yaml --db ops.db
+```
+
+- Vacuum and cleanup (compacts DB; optionally removes empty directories from dataset_root)
+```
+python -m src.cli vacuum --config config.yaml --db ops.db --rm-empty
+```
+
+Configuration keys (Phase 4)
+- tiling.write_cog: true|false  (write tiled GTiff with internal overviews)
+- tiling.block_size: int        (e.g., 256)
+- tiling.overviews: [2,4,8,16]  (overview pyramid factors)
+- tiling.compression: deflate|zstd
+- logging.file: logs/run.log
+- logging.rotation: "10 MB"
 
 12) Chipping details and data model
 
